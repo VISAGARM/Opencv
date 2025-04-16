@@ -1,0 +1,241 @@
+# detect_colors_realtime.py
+# Real-time detection with distance calculation and centering guidance
+
+import cv2
+import numpy as np
+import time
+from colors import (
+    RED_HSV_LOWER1, RED_HSV_UPPER1,
+    RED_HSV_LOWER2, RED_HSV_UPPER2,
+    YELLOW_HSV_LOWER, YELLOW_HSV_UPPER
+)
+
+# Constants for distance calculation
+# These need to be calibrated for your specific camera and use case
+KNOWN_WIDTH = 10  # Width of the reference object in cm
+FOCAL_LENGTH = 500  # Focal length of camera (needs calibration)
+
+# Constants for centering guidance
+CENTER_THRESHOLD = 30  # Pixels from center considered "centered" (adjust as needed)
+
+def calculate_distance(pixel_width):
+    """Calculate distance to object based on its apparent width in pixels."""
+    # Using the formula: distance = (known_width * focal_length) / pixel_width
+    if pixel_width == 0:
+        return float('inf')  # Avoid division by zero
+    
+    distance = (KNOWN_WIDTH * FOCAL_LENGTH) / pixel_width
+    return distance
+
+def get_turning_guidance(center_x, frame_center_x):
+    """Get guidance on how much to turn to center an object."""
+    # Calculate pixel difference from center
+    diff = center_x - frame_center_x
+    
+    # If object is already centered within threshold, no turning needed
+    if abs(diff) <= CENTER_THRESHOLD:
+        return "Centered", 0
+    
+    # Calculate turning amount (this could be adjusted based on your specific needs)
+    # Converting pixel difference to a more intuitive measure
+    # Assuming 1 degree of turning approximately per 10 pixels of difference
+    turning_amount = diff / 10
+    
+    if diff > 0:
+        return "Turn RIGHT", turning_amount
+    else:
+        return "Turn LEFT", abs(turning_amount)
+
+def detect_colors_realtime():
+    """Real-time detection with distance measurement and centering guidance."""
+    # Initialize the webcam
+    cap = cv2.VideoCapture(0)  # 0 is usually the built-in webcam
+    
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+    
+    # Get the webcam frame width and height
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_center_x = frame_width // 2
+    frame_center_y = frame_height // 2
+    
+    print(f"Webcam resolution: {frame_width}x{frame_height}")
+    print("Press 'q' to quit")
+    
+    # For calculating FPS
+    prev_time = 0
+    
+    # Draw center area rectangle (the "centered" threshold zone)
+    def draw_center_zone(frame):
+        cv2.rectangle(
+            frame,
+            (frame_center_x - CENTER_THRESHOLD, frame_center_y - CENTER_THRESHOLD),
+            (frame_center_x + CENTER_THRESHOLD, frame_center_y + CENTER_THRESHOLD),
+            (0, 255, 0), 1
+        )
+    
+    while True:
+        # Capture frame-by-frame
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("Error: Failed to capture frame.")
+            break
+        
+        # Calculate FPS
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if prev_time > 0 else 0
+        prev_time = current_time
+        
+        # Convert to HSV color space
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Create masks for red color (need two masks because red wraps around)
+        red_mask1 = cv2.inRange(hsv_frame, RED_HSV_LOWER1, RED_HSV_UPPER1)
+        red_mask2 = cv2.inRange(hsv_frame, RED_HSV_LOWER2, RED_HSV_UPPER2)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        
+        # Create mask for yellow color
+        yellow_mask = cv2.inRange(hsv_frame, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER)
+        
+        # Apply morphological operations to clean up the masks
+        kernel = np.ones((5, 5), np.uint8)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours in the masks
+        red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        yellow_contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Draw center crosshair and center zone
+        cv2.line(frame, (frame_center_x, frame_center_y - 20), (frame_center_x, frame_center_y + 20), (255, 255, 255), 2)
+        cv2.line(frame, (frame_center_x - 20, frame_center_y), (frame_center_x + 20, frame_center_y), (255, 255, 255), 2)
+        draw_center_zone(frame)
+        
+        # Process red contours
+        for contour in red_contours:
+            # Filter small contours (noise)
+            if cv2.contourArea(contour) < 500:
+                continue
+                
+            # Get bounding rectangle
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Calculate center of contour
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            # Calculate distance using apparent width
+            distance = calculate_distance(w)
+            
+            # Get turning guidance
+            turn_direction, turn_amount = get_turning_guidance(center_x, frame_center_x)
+            
+            # Draw rectangle around the object
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            
+            # Display distance information
+            dist_text = f"Red: {distance:.1f}cm"
+            cv2.putText(frame, dist_text, (x, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            # Display turning guidance
+            if turn_direction == "Centered":
+                guidance_text = "Centered"
+                text_color = (0, 255, 0)  # Green for centered
+            else:
+                guidance_text = f"{turn_direction} {turn_amount:.1f}°"
+                text_color = (0, 0, 255)  # Red for not centered
+            
+            cv2.putText(frame, guidance_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+            
+            # Draw line from center to object
+            cv2.line(frame, (frame_center_x, frame_center_y), (center_x, center_y), (0, 0, 255), 2)
+        
+        # Process yellow contours
+        for contour in yellow_contours:
+            # Filter small contours (noise)
+            if cv2.contourArea(contour) < 500:
+                continue
+                
+            # Get bounding rectangle
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Calculate center of contour
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            # Calculate distance using apparent width
+            distance = calculate_distance(w)
+            
+            # Get turning guidance
+            turn_direction, turn_amount = get_turning_guidance(center_x, frame_center_x)
+            
+            # Draw rectangle around the object
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            
+            # Display distance information
+            dist_text = f"Yellow: {distance:.1f}cm"
+            cv2.putText(frame, dist_text, (x, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            
+            # Display turning guidance
+            if turn_direction == "Centered":
+                guidance_text = "Centered"
+                text_color = (0, 255, 0)  # Green for centered
+            else:
+                guidance_text = f"{turn_direction} {turn_amount:.1f}°"
+                text_color = (0, 255, 255)  # Yellow for not centered
+            
+            cv2.putText(frame, guidance_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+            
+            # Draw line from center to object
+            cv2.line(frame, (frame_center_x, frame_center_y), (center_x, center_y), (0, 255, 255), 2)
+        
+        # Display FPS
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Display the resulting frame
+        cv2.imshow('Color Detection with Centering Guidance', frame)
+        
+        # Break the loop when 'q' is pressed
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    # Release the capture and destroy windows
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    try:
+        detect_colors_realtime()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+
+
+
+
+###################
+#colorspy
+# colors.py
+# HSV color constants for red and yellow
+
+# HSV values are typically:
+# H: 0-179 (OpenCV format) or 0-360 (standard)
+# S: 0-255 (OpenCV format) or 0-100% (standard)
+# V: 0-255 (OpenCV format) or 0-100% (standard)
+
+# Using OpenCV format (most common for image processing)
+# Red HSV range (red wraps around the hue circle)
+RED_HSV_LOWER1 = (0, 100, 100)     # Lower boundary of first red range
+RED_HSV_UPPER1 = (10, 255, 255)    # Upper boundary of first red range
+RED_HSV_LOWER2 = (160, 100, 100)   # Lower boundary of second red range
+RED_HSV_UPPER2 = (179, 255, 255)   # Upper boundary of second red range
+
+# Yellow HSV range
+YELLOW_HSV_LOWER = (20, 100, 100)  # Lower boundary of yellow range
+YELLOW_HSV_UPPER = (40, 255, 255)  # Upper boundary of yellow range
