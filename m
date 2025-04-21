@@ -21,6 +21,33 @@ CMD_RIGHT = "3"
 CMD_STOP = "4"
 CMD_PICK = "5"  # Servo command to pick object
 
+# Track the current movement state
+current_movement = CMD_STOP  # Start with stopped state
+
+# Define detectable objects as a list of dictionaries
+# This makes it easy to add more objects later
+DETECTABLE_OBJECTS = [
+    {
+        'name': 'Tape',
+        'hsv_lower': np.array([0, 83, 78]),
+        'hsv_upper': np.array([53, 215, 255]),
+        'color': (0, 255, 255)  # Yellow color for display (BGR)
+    },
+    {
+        'name': 'Tissue',
+        'hsv_lower': np.array([0, 0, 228]),
+        'hsv_upper': np.array([137, 148, 255]),
+        'color': (255, 0, 255)  # Magenta color for display (BGR)
+    }
+    # Add more objects easily by copying this template:
+    # {
+    #     'name': 'Object_Name',
+    #     'hsv_lower': np.array([h_min, s_min, v_min]),
+    #     'hsv_upper': np.array([h_max, s_max, v_max]),
+    #     'color': (B, G, R)
+    # }
+]
+
 def calculate_distance(pixel_width):
     if pixel_width == 0:
         return float('inf')
@@ -33,25 +60,54 @@ def get_turning_guidance(center_x, frame_center_x):
     turning_amount = diff / 10  # Approx. 1° per 10 pixels
     return ("Turn RIGHT", turning_amount) if diff > 0 else ("Turn LEFT", abs(turning_amount))
 
-def send_command(cmd):
-    """Send command to Arduino through Bluetooth"""
+def send_command(cmd, force_stop=True):
+    """
+    Send command to Arduino through Bluetooth
+    If force_stop is True, always send stop command first before changing direction
+    """
+    global current_movement
+    
     try:
+        # If we're changing direction and force_stop is True, send stop command first
+        if force_stop and cmd != CMD_STOP and current_movement != CMD_STOP:
+            bluetooth.write(CMD_STOP.encode())
+            print(f"Command sent: {CMD_STOP} (stopping before direction change)")
+            time.sleep(0.2)  # Short delay to ensure motor stops
+        
+        # Send the actual command
         bluetooth.write(cmd.encode())
         print(f"Command sent: {cmd}")
+        
+        # Update current movement state
+        current_movement = cmd
         return True
     except Exception as e:
         print(f"Failed to send command: {e}")
         return False
 
+def detect_objects_from_masks(hsv_frame):
+    """
+    Detect objects from HSV masks based on the DETECTABLE_OBJECTS list
+    Returns a combined mask of all objects and individual object masks
+    """
+    combined_mask = None
+    object_masks = []
+    
+    for obj in DETECTABLE_OBJECTS:
+        # Create mask for this object
+        obj_mask = cv2.inRange(hsv_frame, obj['hsv_lower'], obj['hsv_upper'])
+        object_masks.append(obj_mask)
+        
+        # Add to combined mask
+        if combined_mask is None:
+            combined_mask = obj_mask.copy()
+        else:
+            combined_mask = cv2.bitwise_or(combined_mask, obj_mask)
+    
+    return combined_mask, object_masks
+
 def detect_objects_realtime():
-    """Real-time detection of tape and tissue objects with L293D robot control."""
-    
-    # HSV values for tape and tissue
-    TAPE_HSV_LOWER = np.array([0, 83, 78])
-    TAPE_HSV_UPPER = np.array([53, 215, 255])
-    
-    TISSUE_HSV_LOWER = np.array([0, 0, 228])
-    TISSUE_HSV_UPPER = np.array([137, 148, 255])
+    """Real-time detection of objects with L293D robot control."""
     
     # Initialize PiCamera2
     picam2 = Picamera2()
@@ -80,6 +136,11 @@ def detect_objects_realtime():
     last_command_time = 0
     command_cooldown = 0.5  # Seconds between commands
     picking_start_time = 0
+    
+    # Flag to track if servo is returning to initial position after picking
+    servo_returning = False
+    servo_return_start_time = 0
+    SERVO_RETURN_TIME = 5.0  # Time in seconds for servo to return to initial position
 
     def draw_center_zone(frame):
         cv2.rectangle(
@@ -121,12 +182,8 @@ def detect_objects_realtime():
             # Convert to HSV color space
             hsv_frame = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-            # Create masks for tape and tissue
-            tape_mask = cv2.inRange(hsv_frame, TAPE_HSV_LOWER, TAPE_HSV_UPPER)
-            tissue_mask = cv2.inRange(hsv_frame, TISSUE_HSV_LOWER, TISSUE_HSV_UPPER)
-            
-            # Combine masks to detect both objects
-            combined_mask = cv2.bitwise_or(tape_mask, tissue_mask)
+            # Get object masks using our detection function
+            combined_mask, object_masks = detect_objects_from_masks(hsv_frame)
 
             # Enhanced morphological operations for noise reduction
             kernel = np.ones((5, 5), np.uint8)
@@ -156,17 +213,25 @@ def detect_objects_realtime():
                 if area > min_area_threshold:
                     x, y, w, h = cv2.boundingRect(contour)
                     
-                    # Determine object type (tape or tissue)
+                    # Determine object type by checking which mask has the most overlap
                     contour_mask = np.zeros_like(combined_mask)
                     cv2.drawContours(contour_mask, [contour], 0, 255, -1)
                     
-                    tape_overlap = cv2.bitwise_and(contour_mask, tape_mask)
-                    tissue_overlap = cv2.bitwise_and(contour_mask, tissue_mask)
+                    max_overlap = 0
+                    detected_obj_index = 0
                     
-                    tape_pixels = cv2.countNonZero(tape_overlap)
-                    tissue_pixels = cv2.countNonZero(tissue_overlap)
+                    # Check each object mask for overlap
+                    for i, obj_mask in enumerate(object_masks):
+                        overlap = cv2.bitwise_and(contour_mask, obj_mask)
+                        overlap_amount = cv2.countNonZero(overlap)
+                        
+                        if overlap_amount > max_overlap:
+                            max_overlap = overlap_amount
+                            detected_obj_index = i
                     
-                    obj_type = "Tape" if tape_pixels > tissue_pixels else "Tissue"
+                    # Get object info
+                    obj_type = DETECTABLE_OBJECTS[detected_obj_index]['name']
+                    obj_color = DETECTABLE_OBJECTS[detected_obj_index]['color']
                     
                     # Estimate distance based on width
                     estimated_distance = calculate_distance(w)
@@ -180,7 +245,8 @@ def detect_objects_realtime():
                         'w': w,
                         'h': h,
                         'distance': estimated_distance,
-                        'type': obj_type
+                        'type': obj_type,
+                        'color': obj_color
                     })
             
             # Sort contours by distance (closest first)
@@ -189,18 +255,30 @@ def detect_objects_realtime():
             # State machine for robot control
             now = time.time()
             
+            # Handle the servo returning state
+            if servo_returning:
+                if now - servo_return_start_time > SERVO_RETURN_TIME:
+                    servo_returning = False
+                    robot_state = "SEARCHING"
+                    print("Servo returned to initial position, resuming search")
+                else:
+                    # Stay stopped while servo is returning
+                    send_command(CMD_STOP, force_stop=False)
+            
             # Handle state transitions and commands
-            if robot_state == "PICKING":
+            elif robot_state == "PICKING":
                 # Check if picking operation is complete
                 if now - picking_start_time > 5:  # 5 seconds for picking operation
-                    robot_state = "SEARCHING"
-                    print("Picking complete, resuming search")
+                    # Change to servo returning state
+                    servo_returning = True
+                    servo_return_start_time = now
+                    print("Pick complete, waiting for servo to return")
             
             elif robot_state == "STOPPING":
                 # After stopping, initiate picking if an object is close enough
                 if now - last_command_time > 1.0:  # Wait for robot to fully stop
                     if candidate_contours and candidate_contours[0]['distance'] <= STOP_DISTANCE:
-                        send_command(CMD_PICK)
+                        send_command(CMD_PICK, force_stop=False)  # No need to stop before picking
                         robot_state = "PICKING"
                         picking_start_time = now
                         print("Starting pick operation")
@@ -218,6 +296,7 @@ def detect_objects_realtime():
                     x, y, w, h = closest_contour['x'], closest_contour['y'], closest_contour['w'], closest_contour['h']
                     area = closest_contour['area']
                     obj_type = closest_contour['type']
+                    obj_color = closest_contour['color']
                     
                     # Apply smoothing to reduce jitter
                     if prev_w > 0:  # If we have previous measurements
@@ -241,27 +320,35 @@ def detect_objects_realtime():
                     # Object detected within stopping distance and centered
                     if distance <= STOP_DISTANCE and turn_direction == "Centered" and area > PICK_AREA_THRESHOLD:
                         # Object is close enough, stop the robot
-                        send_command(CMD_STOP)
+                        send_command(CMD_STOP, force_stop=False)  # No need to stop before stopping
                         robot_state = "STOPPING"
                         last_command_time = now
                         print(f"Object detected within {distance:.1f}cm - stopping")
                     else:
                         # Navigation commands based on position
                         if turn_direction == "Centered":
-                            send_command(CMD_FORWARD)
+                            # If we're already going forward, no need to stop first
+                            if current_movement == CMD_FORWARD:
+                                force_stop = False
+                            else:
+                                force_stop = True
+                            send_command(CMD_FORWARD, force_stop)
                             print(f"Moving forward - object at {distance:.1f}cm")
                         elif turn_direction == "Turn LEFT":
-                            send_command(CMD_LEFT)
+                            # If we're changing direction, stop first
+                            send_command(CMD_LEFT, force_stop=True)
                             print(f"Turning left - {turn_amount:.1f}°")
                         elif turn_direction == "Turn RIGHT":
-                            send_command(CMD_RIGHT)
+                            # If we're changing direction, stop first
+                            send_command(CMD_RIGHT, force_stop=True)
                             print(f"Turning right - {turn_amount:.1f}°")
                         last_command_time = now
                 elif not candidate_contours and now - last_command_time > command_cooldown:
-                    # No objects found, stop the robot
-                    send_command(CMD_STOP)
-                    last_command_time = now
-                    print("No objects detected - stopping")
+                    # No objects found, stop the robot if not already stopped
+                    if current_movement != CMD_STOP:
+                        send_command(CMD_STOP, force_stop=False)  # No need to stop before stopping
+                        last_command_time = now
+                        print("No objects detected - stopping")
 
             # Visualization for all contours
             for i, contour_data in enumerate(candidate_contours):
@@ -269,12 +356,14 @@ def detect_objects_realtime():
                 area = contour_data['area']
                 distance = contour_data['distance']
                 obj_type = contour_data['type']
+                obj_color = contour_data['color']
                 
-                # Color based on object type and if it's the closest
+                # Color based on if it's the closest (brighten) or not
                 if i == 0:  # Closest object
-                    color = (0, 255, 255) if obj_type == "Tape" else (255, 0, 255)  # Yellow for tape, magenta for tissue
+                    color = obj_color
                 else:
-                    color = (0, 128, 128) if obj_type == "Tape" else (128, 0, 128)  # Dimmer colors for other objects
+                    # Make color dimmer for non-closest objects
+                    color = tuple(int(c/2) for c in obj_color)
                 
                 # Draw rectangle around object
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
@@ -331,11 +420,26 @@ def detect_objects_realtime():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             # Display current robot state
-            cv2.putText(frame, f"State: {robot_state}", (frame_width - 200, 30), 
+            state_display = robot_state
+            if servo_returning:
+                state_display = "SERVO RETURNING"
+                
+            cv2.putText(frame, f"State: {state_display}", (frame_width - 200, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                       
+            # Display current movement command
+            cv2.putText(frame, f"Movement: {current_movement}", (frame_width - 200, 60), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             # Display FPS
             cv2.putText(frame, f"FPS: {avg_fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Display detected objects list
+            cv2.putText(frame, "Detecting:", (10, frame_height - 70), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            for i, obj in enumerate(DETECTABLE_OBJECTS):
+                cv2.putText(frame, f"- {obj['name']}", (30, frame_height - 50 + i*20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, obj['color'], 2)
 
             # Show main detection window
             cv2.imshow("Detection", frame)
@@ -343,7 +447,7 @@ def detect_objects_realtime():
             # Break loop on 'q' key press
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 # Make sure to stop the robot when exiting
-                send_command(CMD_STOP)
+                send_command(CMD_STOP, force_stop=False)
                 break
                 
         except Exception as e:
@@ -351,216 +455,12 @@ def detect_objects_realtime():
             import traceback
             traceback.print_exc()
             # Safety: stop robot on error
-            send_command(CMD_STOP)
+            send_command(CMD_STOP, force_stop=False)
 
     # Clean up
     cv2.destroyAllWindows()
     picam2.stop()
     bluetooth.close()
-
-# Arduino code for L293D motor driver and servo control
-def generate_arduino_code():
-    """Generate Arduino code for L293D motor control and servo pick sequence"""
-    arduino_code = """
-    #include <Servo.h>
-    #include <SoftwareSerial.h>
-    
-    // Bluetooth module connection
-    SoftwareSerial BTSerial(10, 11); // RX, TX
-    
-    // L293D motor driver pins
-    #define ENA 5 // Enable motor A
-    #define ENB 6 // Enable motor B
-    #define IN1 2 // Motor A input 1
-    #define IN2 3 // Motor A input 2
-    #define IN3 4 // Motor B input 1
-    #define IN4 7 // Motor B input 2
-    
-    // Define servo pins
-    #define SERVO1_PIN 8
-    #define SERVO2_PIN 9
-    #define SERVO3_PIN 12
-    #define SERVO4_PIN 13
-    #define SERVO5_PIN A0
-    
-    // Motor speed
-    #define MOTOR_SPEED 200 // 0-255
-    #define TURN_SPEED 150 // Slower for turns
-    
-    // Create servo objects
-    Servo servo1;
-    Servo servo2;
-    Servo servo3;
-    Servo servo4;
-    Servo servo5;
-    
-    // Initial positions
-    int initialPos1 = 90;
-    int initialPos2 = 90;
-    int initialPos3 = 90;
-    int initialPos4 = 90;
-    int initialPos5 = 90;
-    
-    void setup() {
-      Serial.begin(9600);
-      BTSerial.begin(9600);
-      
-      // Setup L293D motor driver pins
-      pinMode(ENA, OUTPUT);
-      pinMode(ENB, OUTPUT);
-      pinMode(IN1, OUTPUT);
-      pinMode(IN2, OUTPUT);
-      pinMode(IN3, OUTPUT);
-      pinMode(IN4, OUTPUT);
-      
-      // Stop motors at startup
-      digitalWrite(IN1, LOW);
-      digitalWrite(IN2, LOW);
-      digitalWrite(IN3, LOW);
-      digitalWrite(IN4, LOW);
-      
-      // Attach servos
-      servo1.attach(SERVO1_PIN);
-      servo2.attach(SERVO2_PIN);
-      servo3.attach(SERVO3_PIN);
-      servo4.attach(SERVO4_PIN);
-      servo5.attach(SERVO5_PIN);
-      
-      // Move servos to initial positions
-      resetServos();
-      
-      Serial.println("Robot ready!");
-    }
-    
-    void loop() {
-      if (BTSerial.available()) {
-        char cmd = BTSerial.read();
-        executeCommand(cmd);
-      }
-    }
-    
-    void executeCommand(char cmd) {
-      Serial.print("Command received: ");
-      Serial.println(cmd);
-      
-      switch(cmd) {
-        case '1': // Forward
-          moveForward();
-          break;
-          
-        case '2': // Left
-          turnLeft();
-          break;
-          
-        case '3': // Right
-          turnRight();
-          break;
-          
-        case '4': // Stop
-          stopMotors();
-          break;
-          
-        case '5': // Pick with servos
-          pickObject();
-          break;
-          
-        default:
-          Serial.println("Unknown command");
-          break;
-      }
-    }
-    
-    void moveForward() {
-      Serial.println("Moving forward");
-      analogWrite(ENA, MOTOR_SPEED);
-      analogWrite(ENB, MOTOR_SPEED);
-      digitalWrite(IN1, HIGH);
-      digitalWrite(IN2, LOW);
-      digitalWrite(IN3, HIGH);
-      digitalWrite(IN4, LOW);
-    }
-    
-    void turnLeft() {
-      Serial.println("Turning left");
-      analogWrite(ENA, TURN_SPEED);
-      analogWrite(ENB, TURN_SPEED);
-      digitalWrite(IN1, LOW);
-      digitalWrite(IN2, HIGH);
-      digitalWrite(IN3, HIGH);
-      digitalWrite(IN4, LOW);
-    }
-    
-    void turnRight() {
-      Serial.println("Turning right");
-      analogWrite(ENA, TURN_SPEED);
-      analogWrite(ENB, TURN_SPEED);
-      digitalWrite(IN1, HIGH);
-      digitalWrite(IN2, LOW);
-      digitalWrite(IN3, LOW);
-      digitalWrite(IN4, HIGH);
-    }
-    
-    void stopMotors() {
-      Serial.println("Stopping motors");
-      digitalWrite(IN1, LOW);
-      digitalWrite(IN2, LOW);
-      digitalWrite(IN3, LOW);
-      digitalWrite(IN4, LOW);
-    }
-    
-    void resetServos() {
-      servo1.write(initialPos1);
-      servo2.write(initialPos2);
-      servo3.write(initialPos3);
-      servo4.write(initialPos4);
-      servo5.write(initialPos5);
-      delay(500);
-    }
-    
-    void pickObject() {
-      Serial.println("Picking object");
-      
-      // Make sure motors are stopped before picking
-      stopMotors();
-      delay(500);
-      
-      // Sequence for picking object with 5 servos
-      // Step 1: Open gripper (Servo 1)
-      servo1.write(160);
-      delay(500);
-      
-      // Step 2: Position arm (Servo 2 & 3)
-      servo2.write(45);
-      delay(300);
-      servo3.write(135);
-      delay(500);
-      
-      // Step 3: Lower arm (Servo 4 & 5)
-      servo4.write(45);
-      delay(300);
-      servo5.write(135);
-      delay(800);
-      
-      // Step 4: Close gripper (Servo 1)
-      servo1.write(90);
-      delay(1000);
-      
-      // Step 5: Lift arm (Servo 4 & 5)
-      servo4.write(90);
-      delay(300);
-      servo5.write(90);
-      delay(500);
-      
-      // Step 6: Return arm to initial position (Servo 2 & 3)
-      servo2.write(90);
-      delay(300);
-      servo3.write(90);
-      delay(500);
-      
-      Serial.println("Pick complete");
-    }
-    """
-    return arduino_code
 
 # Run the main program
 if __name__ == "__main__":
